@@ -1,0 +1,7 @@
+{
+  "watch": ["src"],
+  "ext": "js,json",
+  "ignore": ["node_modules", "prisma"],
+  "exec": "node src/app.js",
+  "delay": "500"
+}

@@ -1,0 +1,358 @@
+// ─── Prisma Schema ────────────────────────────────────────────────────────────
+// EAMS — Employee Attendance Management System
+// All 13 entities from HLD Section 9
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum Role {
+  EMPLOYEE
+  HR_ADMIN
+}
+
+enum RegistrationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum SessionStatus {
+  ACTIVE
+  CLOSED
+  AUTO_CLOSED
+}
+
+enum DutyState {
+  ON
+  OFF
+}
+
+enum AttendanceStatus {
+  NOT_CHECKED_IN
+  WORKING
+  ON_BREAK
+  CHECKED_OUT
+  ON_LEAVE
+  ABSENT
+  AUTO_CLOSED
+}
+
+enum LocationSource {
+  CHECK_IN
+  HEARTBEAT
+  CHECK_OUT
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum DeductionType {
+  SHORT_HOURS
+  UNAPPROVED_ABSENCE
+  LATE
+}
+
+enum LocationRequestStatus {
+  PENDING
+  RESPONDED
+  EXPIRED
+}
+
+enum NotificationChannel {
+  EMAIL
+  IN_APP
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  FAILED
+}
+
+// ─── User ─────────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  role         Role
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  // Relations
+  employee          Employee?          @relation("UserEmployee")
+  approvedEmployees Employee[]         @relation("ApprovedBy")
+  sentMessages      Message[]          @relation("SentMessages")
+  receivedMessages  Message[]          @relation("ReceivedMessages")
+  locationRequests  LocationRequest[]  @relation("IssuedByHR")
+  notifications     Notification[]
+  auditLogs         AuditLog[]
+  refreshTokens     RefreshToken[]
+  reviewedLeaves    LeaveRequest[]     @relation("ReviewedLeaves")
+
+  @@map("users")
+}
+
+// ─── Employee ─────────────────────────────────────────────────────────────────
+
+model Employee {
+  id                 String             @id @default(uuid())
+  userId             String             @unique @map("user_id")
+  workScheduleId     String?            @map("work_schedule_id")
+  employeeCode       String             @unique @map("employee_code")
+  fullName           String             @map("full_name")
+  department         String
+  phone              String?
+  registrationStatus RegistrationStatus @default(PENDING) @map("registration_status")
+  approvedBy         String?            @map("approved_by")
+  approvedAt         DateTime?          @map("approved_at")
+  createdAt          DateTime           @default(now()) @map("created_at")
+
+  // Relations
+  user              User              @relation("UserEmployee", fields: [userId], references: [id])
+  approver          User?             @relation("ApprovedBy", fields: [approvedBy], references: [id])
+  workSchedule      WorkSchedule?     @relation(fields: [workScheduleId], references: [id])
+  sessions          AttendanceSession[]
+  attendances       Attendance[]
+  leaveRequests     LeaveRequest[]
+  leaveBalances     LeaveBalance[]
+  deductions        Deduction[]
+  locationRequests  LocationRequest[]
+
+  @@index([registrationStatus])
+  @@map("employees")
+}
+
+// ─── WorkSchedule ─────────────────────────────────────────────────────────────
+
+model WorkSchedule {
+  id                   String  @id @default(uuid())
+  name                 String
+  expectedDailyHours   Float   @default(8) @map("expected_daily_hours")
+  expectedWeeklyHours  Float   @default(40) @map("expected_weekly_hours")
+  workingDaysMask      String  @default("1111100") @map("working_days_mask") // Mon-Sun, 1=working
+  gracePeriodMinutes   Int     @default(15) @map("grace_period_minutes")
+  gracePeriodHours     Float   @default(0.5) @map("grace_period_hours")
+  createdAt            DateTime @default(now()) @map("created_at")
+
+  employees Employee[]
+
+  @@map("work_schedules")
+}
+
+// ─── AttendanceSession ────────────────────────────────────────────────────────
+
+model AttendanceSession {
+  id              String        @id @default(uuid())
+  employeeId      String        @map("employee_id")
+  checkInAt       DateTime      @map("check_in_at")
+  checkOutAt      DateTime?     @map("check_out_at")
+  checkInLat      Float?        @map("check_in_lat")
+  checkInLng      Float?        @map("check_in_lng")
+  checkOutLat     Float?        @map("check_out_lat")
+  checkOutLng     Float?        @map("check_out_lng")
+  status          SessionStatus @default(ACTIVE)
+  dutyState       DutyState     @default(ON) @map("duty_state")
+  computedHours   Float?        @map("computed_hours")
+  idempotencyKey  String?       @unique @map("idempotency_key")
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  employee        Employee        @relation(fields: [employeeId], references: [id])
+  locationRecords LocationRecord[]
+
+  @@index([employeeId, checkInAt])
+  @@index([employeeId, status])
+  @@map("attendance_sessions")
+}
+
+// ─── Attendance (daily rollup) ─────────────────────────────────────────────
+
+model Attendance {
+  id           String           @id @default(uuid())
+  employeeId   String           @map("employee_id")
+  date         DateTime         @db.Date
+  status       AttendanceStatus @default(NOT_CHECKED_IN)
+  totalHours   Float            @default(0) @map("total_hours")
+  sessionCount Int              @default(0) @map("session_count")
+  isFinalized  Boolean          @default(false) @map("is_finalized")
+  createdAt    DateTime         @default(now()) @map("created_at")
+  updatedAt    DateTime         @updatedAt @map("updated_at")
+
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@unique([employeeId, date])
+  @@index([date, status])
+  @@map("attendances")
+}
+
+// ─── LocationRecord ───────────────────────────────────────────────────────────
+
+model LocationRecord {
+  id                  String         @id @default(uuid())
+  attendanceSessionId String         @map("attendance_session_id")
+  latitude            Float
+  longitude           Float
+  accuracyMeters      Float?         @map("accuracy_meters")
+  recordedAt          DateTime       @map("recorded_at")
+  source              LocationSource
+
+  session AttendanceSession @relation(fields: [attendanceSessionId], references: [id])
+
+  @@index([attendanceSessionId, recordedAt])
+  @@map("location_records")
+}
+
+// ─── LeaveBalance ─────────────────────────────────────────────────────────────
+
+model LeaveBalance {
+  id            String   @id @default(uuid())
+  employeeId    String   @map("employee_id")
+  year          Int
+  entitledDays  Float    @default(24) @map("entitled_days")
+  usedDays      Float    @default(0) @map("used_days")
+  remainingDays Float    @default(24) @map("remaining_days")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@unique([employeeId, year])
+  @@map("leave_balances")
+}
+
+// ─── LeaveRequest ─────────────────────────────────────────────────────────────
+
+model LeaveRequest {
+  id           String      @id @default(uuid())
+  employeeId   String      @map("employee_id")
+  startDate    DateTime    @db.Date @map("start_date")
+  endDate      DateTime    @db.Date @map("end_date")
+  isPartialDay Boolean     @default(false) @map("is_partial_day")
+  partialHours Float?      @map("partial_hours")
+  reason       String?
+  status       LeaveStatus @default(PENDING)
+  reviewedBy   String?     @map("reviewed_by")
+  reviewedAt   DateTime?   @map("reviewed_at")
+  createdAt    DateTime    @default(now()) @map("created_at")
+
+  employee Employee  @relation(fields: [employeeId], references: [id])
+  reviewer User?     @relation("ReviewedLeaves", fields: [reviewedBy], references: [id])
+
+  @@index([employeeId, status])
+  @@map("leave_requests")
+}
+
+// ─── Deduction ────────────────────────────────────────────────────────────────
+
+model Deduction {
+  id           String        @id @default(uuid())
+  employeeId   String        @map("employee_id")
+  periodStart  DateTime      @db.Date @map("period_start")
+  periodEnd    DateTime      @db.Date @map("period_end")
+  type         DeductionType
+  amountUnits  Float         @map("amount_units")
+  ruleApplied  String?       @map("rule_applied")
+  createdAt    DateTime      @default(now()) @map("created_at")
+
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@index([employeeId, periodStart])
+  @@map("deductions")
+}
+
+// ─── Message ──────────────────────────────────────────────────────────────────
+
+model Message {
+  id          String    @id @default(uuid())
+  senderId    String    @map("sender_id")
+  recipientId String    @map("recipient_id")
+  body        String
+  sentAt      DateTime  @default(now()) @map("sent_at")
+  readAt      DateTime? @map("read_at")
+
+  sender    User @relation("SentMessages",     fields: [senderId],    references: [id])
+  recipient User @relation("ReceivedMessages", fields: [recipientId], references: [id])
+
+  @@index([recipientId, sentAt])
+  @@map("messages")
+}
+
+// ─── LocationRequest ──────────────────────────────────────────────────────────
+
+model LocationRequest {
+  id          String                @id @default(uuid())
+  requestedBy String                @map("requested_by")
+  employeeId  String                @map("employee_id")
+  reason      String?
+  status      LocationRequestStatus @default(PENDING)
+  requestedAt DateTime              @default(now()) @map("requested_at")
+  respondedAt DateTime?             @map("responded_at")
+
+  requester User     @relation("IssuedByHR", fields: [requestedBy], references: [id])
+  employee  Employee @relation(fields: [employeeId], references: [id])
+
+  @@map("location_requests")
+}
+
+// ─── Notification ─────────────────────────────────────────────────────────────
+
+model Notification {
+  id          String              @id @default(uuid())
+  recipientId String              @map("recipient_id")
+  type        String
+  payload     Json?
+  channel     NotificationChannel @default(IN_APP)
+  status      NotificationStatus  @default(QUEUED)
+  createdAt   DateTime            @default(now()) @map("created_at")
+
+  recipient User @relation(fields: [recipientId], references: [id])
+
+  @@index([recipientId, status])
+  @@map("notifications")
+}
+
+// ─── AuditLog ─────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  actorId     String   @map("actor_id")
+  action      String
+  entityType  String   @map("entity_type")
+  entityId    String   @map("entity_id")
+  beforeState Json?    @map("before_state")
+  afterState  Json?    @map("after_state")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  actor User @relation(fields: [actorId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+  @@map("audit_logs")
+}
+
+// ─── RefreshToken ─────────────────────────────────────────────────────────────
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  token     String   @unique
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
